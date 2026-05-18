@@ -3,6 +3,7 @@ import pandas as pd
 import altair as alt
 from pathlib import Path
 import re
+import tempfile
 
 st.set_page_config(page_title='CGPA Dashboard 2026', layout='wide')
 
@@ -26,36 +27,90 @@ with st.sidebar.expander('Add course row', expanded=True):
         grade = st.text_input('Grade').upper().strip()
         credits = st.number_input('Credit hours', min_value=0.0, step=0.5, format='%.2f')
         if st.form_submit_button('Add Course Row') and grade and credits > 0:
-            st.session_state.courses = pd.concat([st.session_state.courses, pd.DataFrame([{'Course': course or 'Untitled', 'Grade': grade, 'Credits': credits}])], ignore_index=True)
+            st.session_state.courses = pd.concat(
+                [st.session_state.courses, pd.DataFrame([{'Course': course or 'Untitled', 'Grade': grade, 'Credits': credits}])],
+                ignore_index=True
+            )
+
+def parse_ocr_text(text):
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r'\s{2,}|,|\t', line)
+        if len(parts) >= 3:
+            course = parts[0].strip()
+            grade = parts[1].upper().strip()
+            credit_part = parts[2]
+            m = re.findall(r'[0-9]+(?:\.[0-9]+)?', str(credit_part))
+            if m:
+                try:
+                    rows.append({'Course': course, 'Grade': grade, 'Credits': float(m[0])})
+                except Exception:
+                    pass
+    return pd.DataFrame(rows)
 
 if mode == 'Transcript upload':
     up = st.sidebar.file_uploader('Upload Transcript (PDF, PNG, JPG)', type=['pdf','png','jpg','jpeg'])
     if up is not None:
         st.sidebar.success(f'Uploaded: {up.name}')
-        text = st.sidebar.text_area('OCR/Text fallback input', height=120, placeholder='Paste extracted transcript text here if OCR is unavailable')
-        if text:
-            rows = []
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parts = re.split(r'\s{2,}|,|	', line)
-                if len(parts) >= 3:
-                    course, grade, credits = parts[0], parts[1].upper().strip(), parts[2]
+        submitted = st.sidebar.button('Run OCR / Extract & Calculate')
+        if submitted:
+            extracted = pd.DataFrame()
+            file_suffix = Path(up.name).suffix.lower()
+
+            try:
+                if file_suffix == '.pdf':
                     try:
-                        credits = float(re.findall(r'[0-9]+(?:\.[0-9]+)?', str(credits))[0])
-                        rows.append({'Course': course, 'Grade': grade, 'Credits': credits})
+                        import pdfplumber
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+                            tmp.write(up.getbuffer())
+                            tmp_path = tmp.name
+
+                        text_chunks = []
+                        with pdfplumber.open(tmp_path) as pdf:
+                            for page in pdf.pages:
+                                txt = page.extract_text() or ''
+                                if txt:
+                                    text_chunks.append(txt)
+
+                        extracted = parse_ocr_text('\n'.join(text_chunks))
                     except Exception:
-                        pass
-            if rows:
-                st.session_state.courses = pd.DataFrame(rows)
-                st.sidebar.success(f'Parsed {len(rows)} rows from pasted text.')
+                        st.sidebar.warning('PDF text extraction failed. Paste OCR text below for parsing.')
+                else:
+                    try:
+                        from PIL import Image
+                        import pytesseract
+                        image = Image.open(up)
+                        txt = pytesseract.image_to_string(image)
+                        extracted = parse_ocr_text(txt)
+                    except Exception:
+                        st.sidebar.warning('Image OCR failed. Paste OCR text below for parsing.')
+            except Exception:
+                st.sidebar.warning('Automatic extraction failed.')
+
+            if extracted.empty:
+                fallback = st.sidebar.text_area(
+                    'Paste OCR/Text fallback input',
+                    height=160,
+                    placeholder='Course  Grade  Credits\nMathematics  A  3\n...'
+                )
+                if fallback.strip():
+                    extracted = parse_ocr_text(fallback)
+
+            if not extracted.empty:
+                st.session_state.courses = extracted
+                st.sidebar.success(f'Parsed {len(extracted)} rows and loaded into the dashboard.')
             else:
-                st.sidebar.warning('No rows parsed. Use the manual entry table below to verify OCR output.')
+                st.sidebar.warning('No rows parsed. Please verify file quality or use manual entry.')
 
 mapping = SCALES[scale]
 df = st.session_state.courses.copy()
-edited = st.data_editor(df if not df.empty else pd.DataFrame([{'Course':'Sample Course','Grade':'A','Credits':3.0}]), use_container_width=True, num_rows='dynamic', key='course_editor')
+if df.empty:
+    df = pd.DataFrame([{'Course':'Sample Course','Grade':'A','Credits':3.0}])
+
+edited = st.data_editor(df, use_container_width=True, num_rows='dynamic', key='course_editor')
 
 calc = edited.copy()
 calc['Grade'] = calc['Grade'].astype(str).str.upper().str.strip()
@@ -82,7 +137,7 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric('Final CGPA', f'{cgpa:.2f}')
 c2.metric('Total Credits Earned', f'{total_credits:.2f}')
 c3.metric('Total Quality Points', f'{total_qp:.2f}')
-c4.metric('Academic Standing', f'{standing} {('- ' + honors) if honors else ''}'.strip())
+c4.metric('Academic Standing', f'{standing} {("- " + honors) if honors else ""}'.strip())
 
 left, right = st.columns([1.35, 1])
 with left:
@@ -93,7 +148,10 @@ with right:
     if not calc.empty:
         dist = calc['Grade'].value_counts().reset_index()
         dist.columns = ['Grade','Count']
-        st.altair_chart(alt.Chart(dist).mark_bar().encode(x='Grade:N', y='Count:Q', color='Grade:N'), use_container_width=True)
+        st.altair_chart(
+            alt.Chart(dist).mark_bar().encode(x='Grade:N', y='Count:Q', color='Grade:N'),
+            use_container_width=True
+        )
     else:
         st.info('No valid grade data yet.')
 
